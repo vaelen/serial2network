@@ -1,7 +1,0 @@
-import "google/protobuf/wrappers.proto";
-
-// The service definition.
-service Serial {
-    // Sends a greeting
-    rpc Open (stream google.protobuf.BytesValue) returns (stream google.protobuf.BytesValue) {}
-  }
