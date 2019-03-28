@@ -5,10 +5,12 @@ This code requires go 1.12 or newer to build properly.
 
 To build, run:
 ```
-go build cmd/serial2network
+go build cmd/serial2network/serial2network.go
+go build cmd/client/client.go
 ```
 
 To compile the protobuf, run:
 ```
-protoc api/serial2network.proto --go_out=plugins=grpc:./
+cd api
+protoc api.proto --go_out=plugins=grpc:.
 ```

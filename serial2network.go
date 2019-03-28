@@ -22,13 +22,17 @@ package serial2network
 import (
 	"bufio"
 	"context"
-	"fmt"
 	"github.com/golang/protobuf/ptypes/wrappers"
+	"github.com/google/uuid"
 	"github.com/jacobsa/go-serial/serial"
+	"github.com/vaelen/serial2network/api"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"io"
 	"log"
 	"net"
+	"sync"
 )
 
 // ParityMode represents the various serial device parity modes.
@@ -90,20 +94,18 @@ func Start(ctx context.Context, conf Config) {
 		}
 	}()
 
-	bufferedSerialPort := bufio.NewReadWriter(
-		bufio.NewReader(serialPort),
-		bufio.NewWriter(serialPort),
-	)
+	serialPortIn := bufio.NewReader(serialPort)
+	serialPortOut := bufio.NewWriter(serialPort)
 
 	if conf.Server {
-		startServer(ctx, conf, bufferedSerialPort)
+		startServer(ctx, conf, serialPortIn, serialPortOut)
 		return
 	}
 
-	startClient(ctx, conf, bufferedSerialPort)
+	startClient(ctx, conf, serialPortIn, serialPortOut)
 }
 
-func startServer(ctx context.Context, conf Config, serialPort io.ReadWriter) {
+func startServer(ctx context.Context, conf Config, serialPortIn *bufio.Reader, serialPortOut *bufio.Writer) {
 	log.Printf("Starting server\n")
 
 	l, err := net.Listen("tcp", conf.Network.Address)
@@ -111,7 +113,7 @@ func startServer(ctx context.Context, conf Config, serialPort io.ReadWriter) {
 		log.Fatalf("Couldn't start server: %v\n", err)
 	}
 
-	server := &serialServer{serialPort: serialPort, ctx: ctx}
+	server := newServer(ctx, serialPortIn, serialPortOut)
 	grpcServer := grpc.NewServer()
 
 	defer func() {
@@ -119,7 +121,7 @@ func startServer(ctx context.Context, conf Config, serialPort io.ReadWriter) {
 		grpcServer.Stop()
 	}()
 
-	RegisterSerialServer(grpcServer, server)
+	api.RegisterSerialServer(grpcServer, server)
 
 	go grpcServer.Serve(l)
 
@@ -130,19 +132,19 @@ func startServer(ctx context.Context, conf Config, serialPort io.ReadWriter) {
 
 }
 
-func startClient(ctx context.Context, conf Config, serialPort io.ReadWriter) {
+func startClient(ctx context.Context, conf Config, serialPortIn *bufio.Reader, serialPortOut *bufio.Writer) {
 	log.Printf("Connecting to server\n")
 
 	defer func() {
 		log.Printf("Disconnecting from server\n")
 	}()
 
-	conn, err := grpc.Dial(conf.Network.Address)
+	conn, err := grpc.Dial(conf.Network.Address, grpc.WithInsecure())
 	if err != nil {
 		log.Fatalf("Could not create client: %v\n", err)
 	}
 	defer conn.Close()
-	client := NewSerialClient(conn)
+	client := api.NewSerialClient(conn)
 
 	stream, err := client.Open(ctx)
 	if err != nil {
@@ -152,35 +154,52 @@ func startClient(ctx context.Context, conf Config, serialPort io.ReadWriter) {
 	fromNetwork := make(chan []byte)
 	toNetwork := make(chan []byte)
 
-	go serialPortReader(serialPort, fromNetwork, toNetwork)
+	go serialPortReader(serialPortIn, toNetwork)
 
-	err = serialPortProcessingLoop(ctx, serialPort, fromNetwork, toNetwork, func(data []byte) error {
+	go func() {
+		defer func() {
+			log.Printf("Closing stream reader\n")
+			close(fromNetwork)
+		}()
+		log.Printf("Starting stream reader")
+		for {
+			v, err := stream.Recv()
+			if err == io.EOF {
+				return
+			}
+			if err != nil {
+				log.Fatalf("Error receiving from stream: %v\n", err)
+			}
+			fromNetwork <- v.Value
+		}
+	}()
+
+	serialPortProcessingLoop(ctx, serialPortOut, fromNetwork, toNetwork, func(data []byte) error {
 		return stream.Send(&wrappers.BytesValue{
 			Value: data,
 		})
 	})
-	if err != nil {
-		log.Fatalf("%v\n", err)
-	}
+
 }
 
-func serialPortReader(serialPort io.ReadWriter, fromNetwork chan []byte, toNetwork chan []byte) {
+func serialPortReader(serialPortIn io.Reader, toNetwork chan []byte) error {
 	log.Printf("Starting serial port reader\n")
 
 	defer func() {
 		log.Printf("Closing serial port reader\n")
-		close(fromNetwork)
 		close(toNetwork)
 	}()
 
 	data := make([]byte, 4098)
 
 	for {
-		bytesRead, err := serialPort.Read(data)
+		bytesRead, err := serialPortIn.Read(data)
 		if err != nil {
 			log.Fatalf("Error reading from serial port: %v\n", err)
 		}
 		if bytesRead > 0 {
+			log.Printf("Read from serial port: %q\n", string(data[:bytesRead]))
+
 			toNetwork <- data[:bytesRead]
 		}
 	}
@@ -188,26 +207,28 @@ func serialPortReader(serialPort io.ReadWriter, fromNetwork chan []byte, toNetwo
 
 type dataSender func([]byte) error
 
-func serialPortProcessingLoop(ctx context.Context, serialPort io.ReadWriter, fromNetwork chan []byte, toNetwork chan []byte, f dataSender) error {
+func serialPortProcessingLoop(ctx context.Context, serialPortOut *bufio.Writer, fromNetwork chan []byte, toNetwork chan []byte, f dataSender) {
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return
 		case data := <-fromNetwork:
 			if data == nil {
-				return nil
+				return
 			}
-			_, err := serialPort.Write(data)
+			_, err := serialPortOut.Write(data)
+			serialPortOut.Flush()
 			if err != nil {
-				return fmt.Errorf("error receiving data: %v", err)
+				log.Fatalf("Error writing to serial port: %v\n", err)
 			}
+			log.Printf("Written to serial port: %q\n", string(data))
 		case data := <-toNetwork:
 			if data == nil {
-				return nil
+				return
 			}
 			err := f(data)
 			if err != nil {
-				return fmt.Errorf("error sending data: %v", err)
+				log.Fatalf("Error sending data: %v\n", err)
 			}
 		}
 	}
@@ -243,21 +264,71 @@ func open(conf SerialConfig) io.ReadWriteCloser {
 	return serialPort
 }
 
-// Server implementation
-type serialServer struct {
-	serialPort io.ReadWriter
-	ctx        context.Context
+func newServer(ctx context.Context, serialPortIn *bufio.Reader, serialPortOut *bufio.Writer) *serialServer {
+	s := &serialServer{
+		ctx:           ctx,
+		serialPortIn:  serialPortIn,
+		serialPortOut: serialPortOut,
+		fromNetwork:   make(chan []byte),
+		toNetwork:     make(chan []byte),
+		listeners:     &sync.Map{},
+	}
+	go serialPortReader(s.serialPortIn, s.toNetwork)
+	go serialPortProcessingLoop(s.ctx, s.serialPortOut, s.fromNetwork, s.toNetwork, func(data []byte) error {
+		return s.Send(data)
+	})
+	return s
 }
 
-func (s *serialServer) Open(stream Serial_OpenServer) error {
-	fromNetwork := make(chan []byte)
-	toNetwork := make(chan []byte)
+// Server implementation
+type serialServer struct {
+	serialPortIn  *bufio.Reader
+	serialPortOut *bufio.Writer
+	ctx           context.Context
+	fromNetwork   chan []byte
+	toNetwork     chan []byte
+	listeners     *sync.Map
+}
 
-	go serialPortReader(s.serialPort, fromNetwork, toNetwork)
+func (s *serialServer) Open(stream api.Serial_OpenServer) error {
+	id := uuid.New().String()
 
-	return serialPortProcessingLoop(s.ctx, s.serialPort, fromNetwork, toNetwork, func(data []byte) error {
+	log.Printf("Client connected: %s\n", id)
+	defer log.Printf("Client disconnected: %s\n", id)
+
+	var sender dataSender = func(data []byte) error {
 		return stream.Send(&wrappers.BytesValue{
 			Value: data,
 		})
+	}
+
+	s.listeners.Store(id, sender)
+	defer s.listeners.Delete(id)
+
+	for {
+		v, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			code := status.Code(err)
+			if code != codes.Canceled {
+				log.Printf("Error receiving from stream %s: %v\n", id, err)
+				return err
+			}
+			return nil
+		}
+		s.fromNetwork <- v.Value
+	}
+}
+
+func (s *serialServer) Send(data []byte) error {
+	s.listeners.Range(func(key interface{}, value interface{}) bool {
+		err := (value.(dataSender))(data)
+		if err != nil {
+			log.Printf("Error sending to stream %s: %v\n", key, err)
+		}
+		return true
 	})
+	return nil
 }
