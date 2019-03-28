@@ -20,7 +20,9 @@
 package serial2network
 
 import (
+	"bufio"
 	"context"
+	"fmt"
 	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/jacobsa/go-serial/serial"
 	"google.golang.org/grpc"
@@ -88,15 +90,20 @@ func Start(ctx context.Context, conf Config) {
 		}
 	}()
 
+	bufferedSerialPort := bufio.NewReadWriter(
+		bufio.NewReader(serialPort),
+		bufio.NewWriter(serialPort),
+	)
+
 	if conf.Server {
-		startServer(ctx, conf, serialPort)
+		startServer(ctx, conf, bufferedSerialPort)
 		return
 	}
 
-	startClient(ctx, conf, serialPort)
+	startClient(ctx, conf, bufferedSerialPort)
 }
 
-func startServer(ctx context.Context, conf Config, serialPort io.ReadWriteCloser) {
+func startServer(ctx context.Context, conf Config, serialPort io.ReadWriter) {
 	log.Printf("Starting server\n")
 
 	l, err := net.Listen("tcp", conf.Network.Address)
@@ -123,7 +130,7 @@ func startServer(ctx context.Context, conf Config, serialPort io.ReadWriteCloser
 
 }
 
-func startClient(ctx context.Context, conf Config, serialPort io.ReadWriteCloser) {
+func startClient(ctx context.Context, conf Config, serialPort io.ReadWriter) {
 	log.Printf("Connecting to server\n")
 
 	defer func() {
@@ -147,30 +154,17 @@ func startClient(ctx context.Context, conf Config, serialPort io.ReadWriteCloser
 
 	go serialPortReader(serialPort, fromNetwork, toNetwork)
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case data := <-fromNetwork:
-			if data == nil {
-				return
-			}
-			serialPort.Write(data)
-		case data := <-toNetwork:
-			if data == nil {
-				return
-			}
-			err = stream.Send(&wrappers.BytesValue{
-				Value: data,
-			})
-			if err != nil {
-				log.Fatalf("Error sending data: %v\n", err)
-			}
-		}
+	err = serialPortProcessingLoop(ctx, serialPort, fromNetwork, toNetwork, func(data []byte) error {
+		return stream.Send(&wrappers.BytesValue{
+			Value: data,
+		})
+	})
+	if err != nil {
+		log.Fatalf("%v\n", err)
 	}
 }
 
-func serialPortReader(serialPort io.ReadWriteCloser, fromNetwork chan []byte, toNetwork chan []byte) {
+func serialPortReader(serialPort io.ReadWriter, fromNetwork chan []byte, toNetwork chan []byte) {
 	log.Printf("Starting serial port reader\n")
 
 	defer func() {
@@ -188,6 +182,33 @@ func serialPortReader(serialPort io.ReadWriteCloser, fromNetwork chan []byte, to
 		}
 		if bytesRead > 0 {
 			toNetwork <- data[:bytesRead]
+		}
+	}
+}
+
+type dataSender func([]byte) error
+
+func serialPortProcessingLoop(ctx context.Context, serialPort io.ReadWriter, fromNetwork chan []byte, toNetwork chan []byte, f dataSender) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case data := <-fromNetwork:
+			if data == nil {
+				return nil
+			}
+			_, err := serialPort.Write(data)
+			if err != nil {
+				return fmt.Errorf("error receiving data: %v", err)
+			}
+		case data := <-toNetwork:
+			if data == nil {
+				return nil
+			}
+			err := f(data)
+			if err != nil {
+				return fmt.Errorf("error sending data: %v", err)
+			}
 		}
 	}
 }
@@ -224,7 +245,7 @@ func open(conf SerialConfig) io.ReadWriteCloser {
 
 // Server implementation
 type serialServer struct {
-	serialPort io.ReadWriteCloser
+	serialPort io.ReadWriter
 	ctx        context.Context
 }
 
@@ -234,25 +255,9 @@ func (s *serialServer) Open(stream Serial_OpenServer) error {
 
 	go serialPortReader(s.serialPort, fromNetwork, toNetwork)
 
-	for {
-		select {
-		case <-s.ctx.Done():
-			return nil
-		case data := <-fromNetwork:
-			if data == nil {
-				return nil
-			}
-			s.serialPort.Write(data)
-		case data := <-toNetwork:
-			if data == nil {
-				return nil
-			}
-			err := stream.Send(&wrappers.BytesValue{
-				Value: data,
-			})
-			if err != nil {
-				log.Fatalf("Error sending data: %v\n", err)
-			}
-		}
-	}
+	return serialPortProcessingLoop(s.ctx, s.serialPort, fromNetwork, toNetwork, func(data []byte) error {
+		return stream.Send(&wrappers.BytesValue{
+			Value: data,
+		})
+	})
 }
