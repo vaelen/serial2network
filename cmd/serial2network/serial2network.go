@@ -66,6 +66,45 @@ func (v *parityValue) Type() string {
 	return "mode"
 }
 
+type lineEndingValue struct {
+	lineEnding serial2network.LineEnding
+}
+
+func (v *lineEndingValue) String() string {
+	switch v.lineEnding {
+	case serial2network.Raw:
+		return "RAW"
+	case serial2network.LF:
+		return "LF"
+	case serial2network.CR:
+		return "CR"
+	case serial2network.CRLF:
+		return "CRLF"
+	default:
+		return ""
+	}
+}
+
+func (v *lineEndingValue) Set(s string) error {
+	switch strings.ToUpper(s) {
+	case "RAW":
+		v.lineEnding = serial2network.Raw
+	case "LF":
+		v.lineEnding = serial2network.LF
+	case "CR":
+		v.lineEnding = serial2network.CR
+	case "CRLF":
+		v.lineEnding = serial2network.CRLF
+	default:
+		return fmt.Errorf("invalid line ending: %v", strings.ToUpper(s))
+	}
+	return nil
+}
+
+func (v *lineEndingValue) Type() string {
+	return "line ending"
+}
+
 func defaultConfig() serial2network.Config {
 	return serial2network.Config{
 		SerialPort: serial2network.SerialConfig{
@@ -90,6 +129,14 @@ func parseCommandLine() serial2network.Config {
 		parity: conf.SerialPort.Parity,
 	}
 
+	lineEndingReading := &lineEndingValue{
+		lineEnding: conf.SerialPort.LineEndingForReading,
+	}
+
+	lineEndingWriting := &lineEndingValue{
+		lineEnding: conf.SerialPort.LineEndingForWriting,
+	}
+
 	client := !conf.Server
 
 	flag.StringVar(&conf.SerialPort.Device, "d", conf.SerialPort.Device, "The serial port to connect to")
@@ -99,12 +146,17 @@ func parseCommandLine() serial2network.Config {
 	flag.UintVar(&conf.SerialPort.StopBits, "s", conf.SerialPort.StopBits, "Serial port stop bits")
 	flag.BoolVar(&conf.SerialPort.FlowControl, "f", conf.SerialPort.FlowControl, "Serial port flow control")
 
+	flag.Var(lineEndingReading, "r", "Line ending for reading data: RAW, LF, CR, CRLF")
+	flag.Var(lineEndingWriting, "w", "Line ending for writing data: RAW, LF, CR, CRLF")
+
 	flag.StringVar(&conf.Network.Address, "a", conf.Network.Address, "Network address of the server")
 	flag.BoolVar(&client, "c", client, "Start up in client mode rather than server mode")
 
 	flag.Parse()
 
 	conf.SerialPort.Parity = parity.parity
+	conf.SerialPort.LineEndingForReading = lineEndingReading.lineEnding
+	conf.SerialPort.LineEndingForWriting = lineEndingWriting.lineEnding
 	conf.Server = !client
 
 	return conf

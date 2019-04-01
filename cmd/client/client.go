@@ -50,19 +50,15 @@ func main() {
 
 	address := ":5555"
 
-	convertLFtoCR := false
-	convertLFtoCRLF := false
+	rawMode := false
 
-	flag.BoolVar(&convertLFtoCR, "r", false, "Convert LF (\\n) to CR (\\r) and vice-versa")
-	flag.BoolVar(&convertLFtoCRLF, "n", false, "Convert LF (\\n) to CRLF (\\r\\n) and vice-versa")
+	flag.BoolVar(&rawMode, "r", false, "Raw data mode (instead of line-by-line mode)")
 	flag.StringVar(&address, "s", address, "Network address of the server")
 
 	flag.Parse()
 
-	if convertLFtoCR {
-		log.Printf("Converting LF (\\n) to CR (\\r) and vice-versa\n")
-	} else if convertLFtoCRLF {
-		log.Printf("Converting LF (\\n) to CRLF (\\r\\n) and vice-versa\n")
+	if rawMode {
+		log.Printf("Raw data mode\n")
 	}
 	log.Printf("Connecting to server: %v\n", address)
 
@@ -82,15 +78,36 @@ func main() {
 	}
 	defer stream.CloseSend()
 
-	stdin := bufio.NewReader(os.Stdin)
-	stdout := bufio.NewWriter(os.Stdout)
+	if rawMode {
+		go func() {
+			stdin := bufio.NewReader(os.Stdin)
+			data := make([]byte, 4098)
 
-	go func() {
-		data := make([]byte, 4098)
-		convertedData := make([]byte, 4098*2)
-
-		for {
-			bytesRead, err := stdin.Read(data)
+			for {
+				bytesRead, err := stdin.Read(data)
+				if err == io.EOF {
+					log.Printf("Disconnecting\n")
+					cancel()
+					return
+				}
+				if err != nil {
+					log.Fatalf("Error reading from STDIN: %v\n", err)
+				}
+				if bytesRead > 0 {
+					stream.Send(&wrappers.BytesValue{Value: data[:bytesRead]})
+				}
+			}
+		}()
+	} else {
+		go func() {
+			stdin := bufio.NewScanner(os.Stdin)
+			for stdin.Scan() {
+				data := stdin.Bytes()
+				if len(data) > 0 {
+					stream.Send(&wrappers.BytesValue{Value: data})
+				}
+			}
+			err := stdin.Err()
 			if err == io.EOF {
 				log.Printf("Disconnecting\n")
 				cancel()
@@ -99,29 +116,12 @@ func main() {
 			if err != nil {
 				log.Fatalf("Error reading from STDIN: %v\n", err)
 			}
-			if bytesRead > 0 {
-				dataToSend := convertedData[:0]
-				if convertLFtoCR || convertLFtoCRLF {
-					for _, b := range data[:bytesRead] {
-						if b == '\n' {
-							if convertLFtoCR {
-								dataToSend = append(dataToSend, '\r')
-							} else if convertLFtoCRLF {
-								dataToSend = append(dataToSend, '\r', '\n')
-							}
-						} else {
-							dataToSend = append(dataToSend, b)
-						}
-					}
-				} else {
-					dataToSend = data[:bytesRead]
-				}
-				stream.Send(&wrappers.BytesValue{Value: dataToSend})
-			}
-		}
-	}()
+		}()
+	}
 
 	go func() {
+		stdout := bufio.NewWriter(os.Stdout)
+
 		for {
 			v, err := stream.Recv()
 			if err == io.EOF {
@@ -133,10 +133,13 @@ func main() {
 				log.Fatalf("Error receiving from stream: %v\n", err)
 			}
 			_, err = stdout.Write(v.Value)
+			if !rawMode {
+				stdout.WriteByte('\n')
+			}
+			stdout.Flush()
 			if err != nil {
 				log.Fatalf("Error writing to STDOUT: %v\n", err)
 			}
-			stdout.Flush()
 		}
 	}()
 

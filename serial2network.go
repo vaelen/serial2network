@@ -21,6 +21,7 @@ package serial2network
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/google/uuid"
@@ -60,14 +61,66 @@ func (p ParityMode) String() string {
 	}
 }
 
+// LineEnding defines a specific line ending mode
+type LineEnding uint8
+
+const (
+	// Raw line ending mode performs no transformation.
+	// Data will NOT be sent or received on a line-by-line basis.
+	Raw LineEnding = 0
+	// LF denotes that line endings should be LF (\n) only.
+	// Data will be sent or received on a line-by-line basis.
+	LF LineEnding = 1
+	// CR denotes that line endings should be CR (\r) only.
+	// Data will be sent or received on a line-by-line basis.
+	CR LineEnding = 2
+	// CRLF denotes taht line endings should be CRLF (\r\n).
+	// Data will be sent or received on a line-by-line basis.
+	CRLF LineEnding = 3
+)
+
+// Bytes returns the line ending as a byte slice
+func (le LineEnding) Bytes() []byte {
+	switch le {
+	case Raw:
+		return []byte{}
+	case LF:
+		return []byte{'\n'}
+	case CR:
+		return []byte{'\r'}
+	case CRLF:
+		return []byte{'\r', '\n'}
+	default:
+		return []byte{}
+	}
+}
+
+func (le LineEnding) String() string {
+	switch le {
+	case Raw:
+		return "Raw"
+	case LF:
+		return "LF"
+	case CR:
+		return "CR"
+	case CRLF:
+		return "CRLF"
+	default:
+		return ""
+	}
+
+}
+
 // SerialConfig provides the serial port configuration
 type SerialConfig struct {
-	Device      string
-	BaudRate    uint
-	Parity      ParityMode
-	DataBits    uint
-	StopBits    uint
-	FlowControl bool
+	Device               string
+	BaudRate             uint
+	Parity               ParityMode
+	DataBits             uint
+	StopBits             uint
+	FlowControl          bool
+	LineEndingForReading LineEnding
+	LineEndingForWriting LineEnding
 }
 
 // NetworkConfig provides the network configuration
@@ -94,18 +147,18 @@ func Start(ctx context.Context, conf Config) {
 		}
 	}()
 
-	serialPortIn := bufio.NewReader(serialPort)
-	serialPortOut := bufio.NewWriter(serialPort)
-
 	if conf.Server {
-		startServer(ctx, conf, serialPortIn, serialPortOut)
+		startServer(ctx, conf, serialPort)
 		return
 	}
 
-	startClient(ctx, conf, serialPortIn, serialPortOut)
+	lineEndingIn := conf.SerialPort.LineEndingForReading
+	lineEndingOut := conf.SerialPort.LineEndingForWriting
+
+	startClient(ctx, conf, serialPort, lineEndingIn, lineEndingOut)
 }
 
-func startServer(ctx context.Context, conf Config, serialPortIn *bufio.Reader, serialPortOut *bufio.Writer) {
+func startServer(ctx context.Context, conf Config, serialPort io.ReadWriter) {
 	log.Printf("Starting server\n")
 
 	l, err := net.Listen("tcp", conf.Network.Address)
@@ -113,7 +166,10 @@ func startServer(ctx context.Context, conf Config, serialPortIn *bufio.Reader, s
 		log.Fatalf("Couldn't start server: %v\n", err)
 	}
 
-	server := newServer(ctx, serialPortIn, serialPortOut)
+	lineEndingIn := conf.SerialPort.LineEndingForReading
+	lineEndingOut := conf.SerialPort.LineEndingForWriting
+
+	server := newServer(ctx, serialPort, lineEndingIn, lineEndingOut)
 	grpcServer := grpc.NewServer()
 
 	defer func() {
@@ -132,7 +188,7 @@ func startServer(ctx context.Context, conf Config, serialPortIn *bufio.Reader, s
 
 }
 
-func startClient(ctx context.Context, conf Config, serialPortIn *bufio.Reader, serialPortOut *bufio.Writer) {
+func startClient(ctx context.Context, conf Config, serialPort io.ReadWriter, lineEndingIn LineEnding, lineEndingOut LineEnding) {
 	log.Printf("Connecting to server\n")
 
 	defer func() {
@@ -154,7 +210,11 @@ func startClient(ctx context.Context, conf Config, serialPortIn *bufio.Reader, s
 	fromNetwork := make(chan []byte)
 	toNetwork := make(chan []byte)
 
-	go serialPortReader(serialPortIn, toNetwork)
+	if lineEndingIn == Raw {
+		go serialPortReader(serialPort, toNetwork)
+	} else {
+		go serialPortLineReader(serialPort, toNetwork, lineEndingIn.Bytes())
+	}
 
 	go func() {
 		defer func() {
@@ -174,7 +234,7 @@ func startClient(ctx context.Context, conf Config, serialPortIn *bufio.Reader, s
 		}
 	}()
 
-	serialPortProcessingLoop(ctx, serialPortOut, fromNetwork, toNetwork, func(data []byte) error {
+	serialPortProcessingLoop(ctx, serialPort, lineEndingOut, fromNetwork, toNetwork, func(data []byte) error {
 		return stream.Send(&wrappers.BytesValue{
 			Value: data,
 		})
@@ -182,7 +242,7 @@ func startClient(ctx context.Context, conf Config, serialPortIn *bufio.Reader, s
 
 }
 
-func serialPortReader(serialPortIn io.Reader, toNetwork chan []byte) error {
+func serialPortReader(serialPort io.Reader, toNetwork chan []byte) error {
 	log.Printf("Starting serial port reader\n")
 
 	defer func() {
@@ -190,6 +250,7 @@ func serialPortReader(serialPortIn io.Reader, toNetwork chan []byte) error {
 		close(toNetwork)
 	}()
 
+	serialPortIn := bufio.NewReader(serialPort)
 	data := make([]byte, 4098)
 
 	for {
@@ -205,9 +266,59 @@ func serialPortReader(serialPortIn io.Reader, toNetwork chan []byte) error {
 	}
 }
 
+func serialPortLineReader(serialPort io.Reader, toNetwork chan []byte, lineEnding []byte) {
+	log.Printf("Starting serial port line reader\n")
+
+	defer func() {
+		log.Printf("Closing serial port line reader\n")
+		close(toNetwork)
+	}()
+
+	s := bufio.NewScanner(serialPort)
+	s.Split(createSplitFunc(lineEnding))
+
+	for s.Scan() {
+		b := s.Bytes()
+		if len(b) > 0 {
+			log.Printf("Read from serial port: %q\n", string(b))
+
+			toNetwork <- b
+		}
+	}
+	err := s.Err()
+	if err != nil && err != io.EOF {
+		log.Fatalf("Error reading from serial port: %v\n", err)
+	}
+}
+
+func createSplitFunc(lineEnding []byte) bufio.SplitFunc {
+	return func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+		for i := range data {
+			end := i + 1
+			start := end - len(lineEnding)
+			if start < 0 {
+				continue
+			}
+			ending := data[start:end]
+			if bytes.Equal(ending, lineEnding) {
+				advance = end
+				token = data[0:start]
+				return
+			}
+		}
+		if atEOF && len(data) > 0 {
+			// Return whatever is left
+			advance = len(data)
+			token = data
+		}
+		return
+	}
+}
+
 type dataSender func([]byte) error
 
-func serialPortProcessingLoop(ctx context.Context, serialPortOut *bufio.Writer, fromNetwork chan []byte, toNetwork chan []byte, f dataSender) {
+func serialPortProcessingLoop(ctx context.Context, serialPort io.Writer, lineEnding LineEnding, fromNetwork chan []byte, toNetwork chan []byte, f dataSender) {
+	serialPortOut := bufio.NewWriter(serialPort)
 	for {
 		select {
 		case <-ctx.Done():
@@ -217,6 +328,7 @@ func serialPortProcessingLoop(ctx context.Context, serialPortOut *bufio.Writer, 
 				return
 			}
 			_, err := serialPortOut.Write(data)
+			serialPortOut.Write(lineEnding.Bytes())
 			serialPortOut.Flush()
 			if err != nil {
 				log.Fatalf("Error writing to serial port: %v\n", err)
@@ -264,17 +376,19 @@ func open(conf SerialConfig) io.ReadWriteCloser {
 	return serialPort
 }
 
-func newServer(ctx context.Context, serialPortIn *bufio.Reader, serialPortOut *bufio.Writer) *serialServer {
+func newServer(ctx context.Context, serialPort io.ReadWriter, lineEndingIn LineEnding, lineEndingOut LineEnding) *serialServer {
 	s := &serialServer{
-		ctx:           ctx,
-		serialPortIn:  serialPortIn,
-		serialPortOut: serialPortOut,
-		fromNetwork:   make(chan []byte),
-		toNetwork:     make(chan []byte),
-		listeners:     &sync.Map{},
+		ctx:         ctx,
+		fromNetwork: make(chan []byte),
+		toNetwork:   make(chan []byte),
+		listeners:   &sync.Map{},
 	}
-	go serialPortReader(s.serialPortIn, s.toNetwork)
-	go serialPortProcessingLoop(s.ctx, s.serialPortOut, s.fromNetwork, s.toNetwork, func(data []byte) error {
+	if lineEndingIn == Raw {
+		go serialPortReader(serialPort, s.toNetwork)
+	} else {
+		go serialPortLineReader(serialPort, s.toNetwork, lineEndingIn.Bytes())
+	}
+	go serialPortProcessingLoop(s.ctx, serialPort, lineEndingOut, s.fromNetwork, s.toNetwork, func(data []byte) error {
 		return s.Send(data)
 	})
 	return s
@@ -282,12 +396,12 @@ func newServer(ctx context.Context, serialPortIn *bufio.Reader, serialPortOut *b
 
 // Server implementation
 type serialServer struct {
-	serialPortIn  *bufio.Reader
-	serialPortOut *bufio.Writer
 	ctx           context.Context
 	fromNetwork   chan []byte
 	toNetwork     chan []byte
 	listeners     *sync.Map
+	lineEndingIn  LineEnding
+	lineEndingOut LineEnding
 }
 
 func (s *serialServer) Open(stream api.Serial_OpenServer) error {
